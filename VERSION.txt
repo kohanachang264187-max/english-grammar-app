@@ -1,0 +1,7 @@
+英文法学習アプリ 完成版
+Version: 1.0.0
+Build date: 2026-07-20
+Questions: 2280
+Units: 28
+Subcategories: 112
+Exact duplicate questions: 0
