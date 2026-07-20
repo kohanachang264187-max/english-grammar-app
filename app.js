@@ -25,6 +25,10 @@
   let selectedWordIndices = [];
   let lastTranscript = "";
   let recognition = null;
+  let voiceAutoSubmitTimer = null;
+  let voiceSilenceTimer = null;
+  let voiceSubmissionPending = false;
+  let availableVoices = [];
   let installPrompt = null;
 
   const state = loadState();
@@ -41,7 +45,12 @@
         dailyCount: 12,
         voiceFirst: true,
         showUnitName: true,
-        speechRate: 0.92,
+        speechRate: 0.86,
+        englishAccent: "en-US",
+        englishVoiceName: "",
+        readJapaneseInstruction: false,
+        voiceSilenceMs: 420,
+        autoSubmitVoice: true,
         syncUrl: ""
       },
       stats: {
@@ -920,6 +929,17 @@
         <select id="dailyCount"><option value="10">10問</option><option value="12">12問</option><option value="15">15問</option></select></div>
       <div class="setting-row"><div><strong>音声回答を優先</strong></div><input id="voiceFirst" type="checkbox"></div>
       <div class="setting-row"><div><strong>問題中に単元名を表示</strong></div><input id="showUnitName" type="checkbox"></div>
+      <div class="setting-row"><div><strong>英語読み上げの発音</strong><div class="tiny muted">アメリカ英語またはイギリス英語を選びます</div></div>
+        <select id="englishAccent"><option value="en-US">アメリカ英語</option><option value="en-GB">イギリス英語</option></select></div>
+      <div class="setting-row"><div><strong>英語音声</strong><div class="tiny muted">この端末で利用できる英語音声から選択</div></div>
+        <select id="englishVoice"><option value="">自動選択</option></select></div>
+      <button id="previewEnglishVoice" class="secondary-button" type="button">🔊 選択中の音声を試聴</button>
+      <div class="setting-row"><div><strong>読み上げ速度</strong><div class="tiny muted">受験リスニング練習は標準がおすすめ</div></div>
+        <select id="speechRate"><option value="0.76">ゆっくり</option><option value="0.86">標準</option><option value="0.96">やや速い</option><option value="1.06">速い</option></select></div>
+      <div class="setting-row"><div><strong>音声回答の判定速度</strong><div class="tiny muted">速すぎると語尾を切ることがあります</div></div>
+        <select id="voiceSilenceMs"><option value="320">最速</option><option value="420">高速</option><option value="560">安定</option></select></div>
+      <div class="setting-row"><div><strong>話し終えたら自動判定</strong></div><input id="autoSubmitVoice" type="checkbox"></div>
+      <div class="setting-row"><div><strong>日本語の指示も先に読む</strong><div class="tiny muted">OFFなら英語本文だけを読みます</div></div><input id="readJapaneseInstruction" type="checkbox"></div>
       <div class="setting-row"><div><strong>Google Apps Script同期URL</strong><div class="tiny muted">空欄なら端末内だけに保存</div></div></div>
       <input id="syncUrl" type="url" value="${escapeHTML(state.settings.syncUrl)}" placeholder="https://script.google.com/macros/s/.../exec">
       <div class="button-row">
@@ -933,15 +953,29 @@
     document.getElementById("dailyCount").value = String(state.settings.dailyCount);
     document.getElementById("voiceFirst").checked = state.settings.voiceFirst;
     document.getElementById("showUnitName").checked = state.settings.showUnitName;
-    ["dailyCount","voiceFirst","showUnitName","syncUrl"].forEach(id => {
+    document.getElementById("englishAccent").value = state.settings.englishAccent || "en-US";
+    document.getElementById("speechRate").value = String(state.settings.speechRate || 0.86);
+    document.getElementById("voiceSilenceMs").value = String(state.settings.voiceSilenceMs || 420);
+    document.getElementById("autoSubmitVoice").checked = state.settings.autoSubmitVoice !== false;
+    document.getElementById("readJapaneseInstruction").checked = Boolean(state.settings.readJapaneseInstruction);
+    populateEnglishVoiceSelect();
+    ["dailyCount","voiceFirst","showUnitName","englishAccent","englishVoice","speechRate","voiceSilenceMs","autoSubmitVoice","readJapaneseInstruction","syncUrl"].forEach(id => {
       document.getElementById(id).addEventListener("change", () => {
         state.settings.dailyCount = Number(document.getElementById("dailyCount").value);
         state.settings.voiceFirst = document.getElementById("voiceFirst").checked;
         state.settings.showUnitName = document.getElementById("showUnitName").checked;
+        state.settings.englishAccent = document.getElementById("englishAccent").value;
+        state.settings.englishVoiceName = document.getElementById("englishVoice").value;
+        state.settings.speechRate = Number(document.getElementById("speechRate").value);
+        state.settings.voiceSilenceMs = Number(document.getElementById("voiceSilenceMs").value);
+        state.settings.autoSubmitVoice = document.getElementById("autoSubmitVoice").checked;
+        state.settings.readJapaneseInstruction = document.getElementById("readJapaneseInstruction").checked;
         state.settings.syncUrl = document.getElementById("syncUrl").value.trim();
         saveState();
+        if (id === "englishAccent") populateEnglishVoiceSelect();
       });
     });
+    document.getElementById("previewEnglishVoice").addEventListener("click", previewEnglishVoice);
     document.getElementById("cloudSave").addEventListener("click", saveCloud);
     document.getElementById("cloudLoad").addEventListener("click", loadCloud);
     document.getElementById("resetData").addEventListener("click", resetData);
@@ -1045,30 +1079,91 @@
       recognition = null;
       return;
     }
+
+    clearTimeout(voiceAutoSubmitTimer);
+    clearTimeout(voiceSilenceTimer);
+    voiceSubmissionPending = false;
+    lastTranscript = "";
+
     recognition = new SpeechRecognition();
-    recognition.lang = q.format === "EJ" ? "ja-JP" : "en-US";
+    recognition.lang = q.format === "EJ" ? "ja-JP" : (state.settings.englishAccent || "en-US");
     recognition.interimResults = true;
     recognition.continuous = false;
+    recognition.maxAlternatives = 3;
+
     const mic = document.getElementById("micButton");
     const status = document.getElementById("speechStatus");
     mic?.classList.add("listening");
     if (mic) mic.textContent = "■ 聞き取り中";
-    if (status) status.textContent = "話し終わると自動で止まります。";
+    if (status) status.textContent = "話し終わるとすぐに判定します。";
+
+    const submitVoiceAnswer = () => {
+      if (voiceSubmissionPending || !lastTranscript.trim()) return;
+      if (state.settings.autoSubmitVoice === false) {
+        if (status) status.textContent = `認識結果：${lastTranscript}。「確認する」を押してください。`;
+        return;
+      }
+      const submitButton = document.getElementById("submitAnswer");
+      if (!submitButton || submitButton.disabled) return;
+      voiceSubmissionPending = true;
+      if (status) status.textContent = `判定中：${lastTranscript}`;
+      voiceAutoSubmitTimer = setTimeout(() => submitCurrentAnswer(q), 40);
+    };
+
     recognition.onresult = event => {
-      const transcript = Array.from(event.results).map(r => r[0].transcript).join(" ");
-      lastTranscript = transcript;
+      clearTimeout(voiceSilenceTimer);
+      let transcript = "";
+      let hasFinalResult = false;
+      for (let i = 0; i < event.results.length; i++) {
+        transcript += `${event.results[i][0].transcript} `;
+        if (event.results[i].isFinal) hasFinalResult = true;
+      }
+      lastTranscript = transcript.trim();
       const area = document.getElementById("textAnswer");
-      if (area) area.value = transcript;
+      if (area) area.value = lastTranscript;
+      if (status) status.textContent = `認識中：${lastTranscript}`;
+
+      if (hasFinalResult) {
+        try { recognition.stop(); } catch {}
+        submitVoiceAnswer();
+        return;
+      }
+
+      // Chromebookなど確定通知が遅い端末向け。最後の認識更新から設定時間で締めます。
+      const silenceMs = Math.max(280, Number(state.settings.voiceSilenceMs) || 420);
+      voiceSilenceTimer = setTimeout(() => {
+        try { recognition?.stop(); } catch {}
+      }, silenceMs);
     };
-    recognition.onerror = () => {
-      showToast("音声を認識できませんでした。成績には含めません。");
+
+    recognition.onspeechend = () => {
+      clearTimeout(voiceSilenceTimer);
+      try { recognition?.stop(); } catch {}
     };
+
+    recognition.onerror = event => {
+      clearTimeout(voiceSilenceTimer);
+      clearTimeout(voiceAutoSubmitTimer);
+      voiceSubmissionPending = false;
+      if (event.error !== "no-speech" && event.error !== "aborted") {
+        showToast("音声を認識できませんでした。成績には含めません。");
+      }
+    };
+
     recognition.onend = () => {
+      clearTimeout(voiceSilenceTimer);
       mic?.classList.remove("listening");
       if (mic) mic.textContent = "🎙️ 音声で回答";
-      if (status) status.textContent = lastTranscript ? `認識結果：${lastTranscript}` : "文字入力でも回答できます。";
       recognition = null;
+      if (lastTranscript.trim()) {
+        if (status) status.textContent = `判定中：${lastTranscript}`;
+        submitVoiceAnswer();
+      } else {
+        voiceSubmissionPending = false;
+        if (status) status.textContent = "聞き取れませんでした。もう一度話すか、文字で入力してください。";
+      }
     };
+
     recognition.start();
   }
 
@@ -1087,15 +1182,188 @@
     rec.start();
   }
 
-  function speakCurrentQuestion() {
+  function refreshAvailableVoices() {
+    if (!("speechSynthesis" in window)) {
+      availableVoices = [];
+      return availableVoices;
+    }
+    availableVoices = window.speechSynthesis.getVoices() || [];
+    return availableVoices;
+  }
+
+  function getAvailableVoices() {
+    return availableVoices.length ? availableVoices : refreshAvailableVoices();
+  }
+
+  function normalizedLanguage(value) {
+    return String(value || "").toLowerCase().replace("_", "-");
+  }
+
+  function voiceQualityScore(voice, language) {
+    const requested = normalizedLanguage(language || "en-US");
+    const lang = normalizedLanguage(voice.lang);
+    const name = String(voice.name || "").toLowerCase();
+    let score = 0;
+
+    if (lang === requested) score += 80;
+    else if (lang.startsWith(requested.slice(0, 2))) score += 45;
+    else return -1000;
+
+    const preferred = requested.startsWith("en-gb")
+      ? ["google uk english", "microsoft sonia", "microsoft ryan", "daniel", "serena", "kate"]
+      : ["google us english", "microsoft aria", "microsoft jenny", "samantha", "alex", "karen", "victoria"];
+
+    preferred.forEach((keyword, index) => {
+      if (name.includes(keyword)) score += 55 - index * 4;
+    });
+
+    if (voice.localService === false) score += 8;
+    if (voice.default) score += 3;
+    if (/compact|espeak|festival/i.test(name)) score -= 20;
+    return score;
+  }
+
+  function getEnglishVoices(language) {
+    return getAvailableVoices()
+      .filter(voice => normalizedLanguage(voice.lang).startsWith("en"))
+      .sort((a, b) => voiceQualityScore(b, language) - voiceQualityScore(a, language)
+        || String(a.name).localeCompare(String(b.name)));
+  }
+
+  function selectVoice(language) {
+    const voices = getEnglishVoices(language);
+    const savedName = String(state.settings.englishVoiceName || "");
+    const selected = voices.find(voice => voice.name === savedName);
+    return selected || voices[0] || null;
+  }
+
+  function populateEnglishVoiceSelect() {
+    const select = document.getElementById("englishVoice");
+    if (!select) return;
+
+    refreshAvailableVoices();
+    const language = document.getElementById("englishAccent")?.value
+      || state.settings.englishAccent
+      || "en-US";
+    const voices = getEnglishVoices(language);
+    const current = String(state.settings.englishVoiceName || "");
+
+    select.innerHTML = '<option value="">自動選択（おすすめ）</option>'
+      + voices.map(voice => {
+        const selected = voice.name === current ? " selected" : "";
+        const service = voice.localService ? "端末" : "オンライン";
+        return `<option value="${escapeHTML(voice.name)}"${selected}>${escapeHTML(voice.name)} — ${escapeHTML(voice.lang)}・${service}</option>`;
+      }).join("");
+
+    if (current && !voices.some(voice => voice.name === current)) {
+      state.settings.englishVoiceName = "";
+      saveState();
+    }
+  }
+
+  function containsEnglish(text) {
+    return /[A-Za-z]/.test(String(text || ""));
+  }
+
+  function prepareEnglishSpeech(text) {
+    return String(text || "")
+      .replace(/（\s*　*\s*）|\(\s*_{2,}\s*\)|_{2,}/g, ", blank, ")
+      .replace(/\s*\/\s*/g, ", ")
+      .replace(/[ぁ-んァ-ヶ一-龠]+/g, " ")
+      .replace(/[「」『』【】［］]/g, " ")
+      .replace(/\s+([,.!?;:])/g, "$1")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function safeEnglishParts(question) {
+    if (!question) return [];
+    const candidates = [];
+
+    if (question.format === "EC" || question.format === "OR") {
+      candidates.push(question.stimulus);
+    } else if (question.format === "JE" || question.format === "MX") {
+      // 正解を読み上げると答えが分かる形式では読みません。
+    } else {
+      candidates.push(question.prompt);
+      if (question.stimulus && question.stimulus !== question.prompt) candidates.push(question.stimulus);
+    }
+
+    return candidates
+      .filter(text => text && containsEnglish(text))
+      .map(prepareEnglishSpeech)
+      .filter(text => containsEnglish(text));
+  }
+
+  function speakUtterance(text, language, options = {}) {
+    return new Promise(resolve => {
+      const cleanText = String(text || "").trim();
+      if (!cleanText) return resolve();
+
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.lang = language;
+      utterance.rate = Number(options.rate) || 0.86;
+      utterance.pitch = Number(options.pitch) || 1;
+      utterance.volume = 1;
+
+      if (normalizedLanguage(language).startsWith("en")) {
+        const voice = selectVoice(language);
+        if (voice) {
+          utterance.voice = voice;
+          utterance.lang = voice.lang || language;
+        }
+      } else {
+        const japaneseVoice = getAvailableVoices().find(v => normalizedLanguage(v.lang).startsWith("ja"));
+        if (japaneseVoice) utterance.voice = japaneseVoice;
+      }
+
+      utterance.onend = resolve;
+      utterance.onerror = resolve;
+      window.speechSynthesis.speak(utterance);
+    });
+  }
+
+  async function previewEnglishVoice() {
+    if (!("speechSynthesis" in window)) {
+      showToast("この端末では読み上げを利用できません。");
+      return;
+    }
+    state.settings.englishVoiceName = document.getElementById("englishVoice")?.value || "";
+    state.settings.englishAccent = document.getElementById("englishAccent")?.value || "en-US";
+    state.settings.speechRate = Number(document.getElementById("speechRate")?.value) || 0.86;
+    saveState();
+
+    window.speechSynthesis.cancel();
+    await speakUtterance(
+      "The more you practice, the better you become.",
+      state.settings.englishAccent,
+      {rate: state.settings.speechRate}
+    );
+  }
+
+  async function speakCurrentQuestion() {
     const q = currentQuestion;
     if (!q || !("speechSynthesis" in window)) return;
-    speechSynthesis.cancel();
-    const text = [q.instruction, q.prompt, q.stimulus].filter(Boolean).join(" ");
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = /[ぁ-んァ-ヶ一-龠]/.test(text) ? "ja-JP" : "en-US";
-    utterance.rate = Number(state.settings.speechRate) || 0.92;
-    speechSynthesis.speak(utterance);
+    window.speechSynthesis.cancel();
+
+    refreshAvailableVoices();
+    const accent = state.settings.englishAccent || "en-US";
+    const rate = Number(state.settings.speechRate) || 0.86;
+    const englishParts = safeEnglishParts(q);
+    const japaneseInstruction = String(q.instruction || "").trim();
+
+    if (state.settings.readJapaneseInstruction && japaneseInstruction) {
+      await speakUtterance(japaneseInstruction, "ja-JP", {rate:0.95});
+    }
+
+    if (!englishParts.length) {
+      showToast("この問題は、答えが分かるため英語の読み上げを行いません。");
+      return;
+    }
+
+    for (const part of englishParts) {
+      await speakUtterance(part, accent, {rate, pitch:1});
+    }
   }
 
   function showToast(message) {
@@ -1127,6 +1395,14 @@
     event.preventDefault();
     installPrompt = event;
   });
+
+  if ("speechSynthesis" in window) {
+    refreshAvailableVoices();
+    window.speechSynthesis.addEventListener?.("voiceschanged", () => {
+      refreshAvailableVoices();
+      populateEnglishVoiceSelect();
+    });
+  }
 
   if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
     navigator.serviceWorker.register("sw.js").catch(console.error);
